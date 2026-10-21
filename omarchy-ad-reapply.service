@@ -1,0 +1,8 @@
+[Unit]
+Description=Re-apply the Active Directory integration after an Omarchy change
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/omarchy-setup-ad reapply

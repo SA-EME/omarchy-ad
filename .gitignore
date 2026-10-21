@@ -1,0 +1,42 @@
+# makepkg build output
+src/
+pkg/
+*.pkg.tar.*
+*.src.tar.*
+*.log
+
+# Downloaded sources and VCS checkouts made by makepkg
+*.tar.gz
+*.tar.xz
+*.tar.zst
+*.zip
+
+# Temporary and backup files
+*.new
+*.bak
+*.orig
+*.tmp
+*~
+*.swp
+*.swo
+
+# Local configuration and secrets: never commit these
+.env
+*.env
+/etc-omarchy-ad.conf
+omarchy-ad.conf
+*.key
+*.pem
+*.keytab
+krb5.keytab
+sssd.conf
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local notes and session data
+*.local.md
+notes/

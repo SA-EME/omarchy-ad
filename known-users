@@ -1,0 +1,15 @@
+#!/bin/bash
+# Writes the login-screen user list from the owners of /home/* (local and AD accounts)
+
+out=/usr/share/sddm/themes/omarchy-users/Users.js
+[[ -d $(dirname "$out") ]] || exit 0
+
+names=$(
+  for d in /home/*/; do
+    [[ -d $d ]] && stat -c '%U' "$d"
+  done | grep -vE '^(UNKNOWN|root)$' | sort -u | sed 's/.*/"&"/' | paste -sd,
+)
+
+printf '.pragma library\nvar list = [%s]\n' "$names" >"$out.tmp"
+chmod 644 "$out.tmp"
+mv "$out.tmp" "$out"

@@ -1,0 +1,6 @@
+[Unit]
+Description=Refresh the login screen user list
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/omarchy-ad/known-users

@@ -1,0 +1,10 @@
+[Unit]
+Description=Watch the files Omarchy updates can overwrite (lock screen PAM, nsswitch)
+
+[Path]
+PathChanged=/etc/pam.d/omarchy-lock-password
+PathChanged=/etc/nsswitch.conf
+Unit=omarchy-ad-reapply.service
+
+[Install]
+WantedBy=multi-user.target

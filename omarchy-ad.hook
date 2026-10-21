@@ -1,0 +1,13 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = omarchy
+Target = omarchy-settings
+Target = pam
+Target = filesystem
+
+[Action]
+Description = Re-applying the Active Directory integration for Omarchy...
+When = PostTransaction
+Exec = /usr/bin/omarchy-setup-ad reapply

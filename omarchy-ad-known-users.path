@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch /home for new accounts (login screen user list)
+
+[Path]
+PathChanged=/home
+Unit=omarchy-ad-known-users.service
+
+[Install]
+WantedBy=multi-user.target

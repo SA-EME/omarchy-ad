@@ -1,0 +1,541 @@
+#!/bin/bash
+
+# omarchy:summary=Join Active Directory and enable the multi-user login screen
+# omarchy:args=<join|login|sudo|all|reapply|status|undo> [options]
+
+set -euo pipefail
+
+CONF=/etc/omarchy-ad.conf
+STATE=/var/lib/omarchy-ad
+SHARE=/usr/share/omarchy-ad
+LIB=/usr/lib/omarchy-ad
+THEMES=/usr/share/sddm/themes
+THEME=omarchy-users
+SDDM_D=/etc/sddm.conf.d
+SDDM_LUA=/etc/sddm-hyprland.lua
+LOCK_PAM=/etc/pam.d/omarchy-lock-password
+SU_PAM=/etc/pam.d/su
+LOGIN_PAM=/etc/pam.d/system-login
+NSS_CONF=/etc/nsswitch.conf
+SSSD_CONF=/etc/sssd/sssd.conf
+SUDOERS=/etc/sudoers.d/50-ad-admins
+POLKIT=/etc/polkit-1/rules.d/50-ad-admins.rules
+
+DOMAIN=""
+JOIN_USER=""
+ALLOWED_GROUP=""
+ADMIN_GROUP=""
+KB_LAYOUT=""
+LOGIN_MONITOR=""
+LOGIN_ENABLED="no"
+SUDO_RULES="yes"
+LEAVE_DOMAIN="no"
+AUTOLOGIN_USER=""
+RESTORE_AUTOLOGIN_USER=""
+SUBARG=()
+ASSUME_YES="no"
+
+usage() {
+  cat <<'EOF'
+Usage: omarchy-setup-ad <command> [options]
+
+Commands:
+  join      Join the domain and configure SSSD (short names, /home/%u, allowed group)
+  sudo      Give the admin group sudo and polkit administrator rights
+  login     Enable the multi-user login screen (theme, no autologin, keyboard, user list)
+  all       join + sudo + login
+  reapply   Re-apply the changes Omarchy updates can overwrite (run automatically)
+  autologin <on <user>|off>
+            Turn automatic login on for one account, or back off
+  status    Check that everything is in place
+  undo      Remove what this tool added (use --leave to also leave the domain)
+
+Options:
+  --domain <dns-name>           AD domain, e.g. example.corp (saved in /etc/omarchy-ad.conf)
+  --join-user <account>         AD account allowed to join computers (asked if omitted)
+  --allowed-group <group[,..]>  AD group(s) allowed to log in (simple_allow_groups)
+  --admin-group <group>         AD group that gets sudo (default: the allowed group)
+  --no-sudo-rules               Do not create sudo and polkit rules
+  --kb-layout <layout>          Keyboard layout of the login screen (default: system layout)
+  --login-monitor <auto|all|output>
+                                Login screen monitors: auto (default) keeps only the laptop
+                                panel, all keeps every monitor, or name one output (e.g. DP-1)
+  --leave                       With undo: also run "realm leave"
+  --autologin-user <account>    With undo: restore automatic login for this account
+                                (only needed if no backup of the old setting exists)
+  --yes                         Do not ask for confirmation
+EOF
+}
+
+log() { printf '==> %s\n' "$*"; }
+warn() { printf 'WARNING: %s\n' "$*" >&2; }
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+need() {
+  local c
+  for c in "$@"; do
+    command -v "$c" >/dev/null || die "missing command: $c (install the omarchy-ad package dependencies)"
+  done
+}
+
+confirm() {
+  if [[ $ASSUME_YES == yes ]]; then return 0; fi
+  local a
+  read -r -p "$1 [y/N] " a
+  [[ $a == [yY]* ]]
+}
+
+load_conf() {
+  if [[ -f $CONF ]]; then
+    # shellcheck disable=SC1090
+    source "$CONF"
+  fi
+}
+
+save_conf() {
+  local v
+  {
+    echo "# Managed by omarchy-setup-ad"
+    for v in DOMAIN ALLOWED_GROUP ADMIN_GROUP KB_LAYOUT LOGIN_MONITOR LOGIN_ENABLED SUDO_RULES AUTOLOGIN_USER; do
+      printf '%s=%q\n' "$v" "${!v}"
+    done
+  } >"$CONF.new"
+  chmod 644 "$CONF.new"
+  mv "$CONF.new" "$CONF"
+}
+
+backup_once() {
+  install -d -m 755 "$STATE/backup"
+  if [[ -f $1 && ! -f $STATE/backup/$(basename "$1").orig ]]; then
+    cp -a "$1" "$STATE/backup/$(basename "$1").orig"
+  fi
+}
+
+# Set key = value inside [domain/$DOMAIN] of sssd.conf, keeping owner and mode
+sssd_set() {
+  local key=$1 value=$2 tmp
+  tmp=$(mktemp)
+  awk -v section="[domain/$DOMAIN]" -v key="$key" -v value="$value" '
+    function flush() {
+      if (insec && !done) { print key " = " value; done = 1 }
+      printf "%s", blanks; blanks = ""
+    }
+    $0 == section { insec = 1; print; next }
+    /^\[/ { flush(); insec = 0 }
+    insec && /^[ \t]*$/ { blanks = blanks $0 "\n"; next }
+    insec && $0 ~ "^[ \t]*" key "[ \t]*=" { if (!done) { print key " = " value; done = 1 } ; printf "%s", blanks; blanks = ""; next }
+    insec { printf "%s", blanks; blanks = "" }
+    { print }
+    END { flush() }
+  ' "$SSSD_CONF" >"$tmp"
+  cat "$tmp" >"$SSSD_CONF"
+  rm -f "$tmp"
+}
+
+require_domain() {
+  [[ -n $DOMAIN ]] || die "--domain is required (e.g. --domain example.corp)"
+  [[ $DOMAIN =~ ^[A-Za-z0-9.-]+$ ]] || die "invalid domain: $DOMAIN"
+}
+
+check_group_name() {
+  [[ $1 =~ ^[^\"\\]+$ ]] || die "invalid group name: $1"
+}
+
+cmd_join() {
+  require_domain
+  need realm adcli sssd
+  timedatectl set-ntp true || true
+
+  case "$(hostnamectl --static 2>/dev/null)" in
+    *.*) ;;
+    *) warn "hostname is not a FQDN; set it first: hostnamectl set-hostname <NAME>.$DOMAIN" ;;
+  esac
+
+  log "Discovering $DOMAIN"
+  realm discover "$DOMAIN" >/dev/null || die "cannot discover $DOMAIN: check that DNS points to a domain controller"
+
+  if realm list --name-only 2>/dev/null | grep -qix "$DOMAIN"; then
+    log "Already joined to $DOMAIN"
+  else
+    if [[ -z $JOIN_USER ]]; then
+      read -r -p "AD account allowed to join computers: " JOIN_USER
+    fi
+    realm join -v -U "$JOIN_USER" "$DOMAIN"
+  fi
+
+  [[ -f $SSSD_CONF ]] || die "$SSSD_CONF not found after the join"
+  backup_once "$SSSD_CONF"
+  sssd_set use_fully_qualified_names False
+  sssd_set fallback_homedir /home/%u
+  if [[ -n $ALLOWED_GROUP ]]; then
+    check_group_name "$ALLOWED_GROUP"
+    sssd_set access_provider simple
+    sssd_set simple_allow_groups "$ALLOWED_GROUP"
+  else
+    warn "no --allowed-group: access stays as configured by realm"
+  fi
+  chmod o-rwx "$SSSD_CONF"
+
+  ensure_mkhomedir
+  patch_nss
+  patch_su
+  patch_lock || true
+
+  systemctl enable --now sssd
+  systemctl restart sssd
+  sss_cache -E || true
+  if grep -qE '^[[:space:]]*debug_level' "$SSSD_CONF"; then
+    warn "debug_level is set in $SSSD_CONF (remove it once debugging is over)"
+  fi
+}
+
+ensure_mkhomedir() {
+  if grep -qs 'pam_mkhomedir' /etc/pam.d/sssd-arch /etc/pam.d/system-auth "$LOGIN_PAM"; then return 0; fi
+  log "Adding pam_mkhomedir to $LOGIN_PAM"
+  backup_once "$LOGIN_PAM"
+  printf 'session required pam_mkhomedir.so skel=/etc/skel umask=0077 # omarchy-ad\n' >>"$LOGIN_PAM"
+}
+
+patch_su() {
+  [[ -f $SU_PAM ]] || return 0
+  backup_once "$SU_PAM"
+  sed -i -E \
+    -e 's/^auth[[:space:]]+required[[:space:]]+pam_unix\.so[[:space:]]*$/auth include system-auth/' \
+    -e 's/^account[[:space:]]+required[[:space:]]+pam_unix\.so[[:space:]]*$/account include system-auth/' \
+    -e 's/^session[[:space:]]+required[[:space:]]+pam_unix\.so[[:space:]]*$/session include system-auth/' \
+    "$SU_PAM"
+}
+
+nss_has_sss() { grep -qE "^$1:.*[[:space:]]sss([[:space:]]|\$)" "$NSS_CONF"; }
+
+# Omarchy and filesystem updates can rewrite nsswitch.conf without sss
+patch_nss() {
+  [[ -f $NSS_CONF ]] || return 0
+  backup_once "$NSS_CONF"
+  sed -i -E '/^(passwd|group|shadow|gshadow):/{/[[:space:]]sss([[:space:]]|$)/!s/[[:space:]]*$/ sss/}' "$NSS_CONF"
+}
+
+lock_has_auth() { grep -qE '^auth[[:space:]].*pam_sss\.so' "$LOCK_PAM"; }
+lock_has_account() { grep -qE '^account[[:space:]].*pam_sss\.so' "$LOCK_PAM"; }
+
+patch_lock() {
+  if [[ ! -f $LOCK_PAM ]]; then
+    warn "$LOCK_PAM not found: the lock screen will not accept AD accounts"
+    return 1
+  fi
+  backup_once "$LOCK_PAM"
+  if ! lock_has_auth; then
+    sed -i '/pam_unix.so try_first_pass/i auth       sufficient                  pam_sss.so forward_pass' "$LOCK_PAM"
+  fi
+  if ! lock_has_account; then
+    sed -i '/^account .*system-local-login/i account    [success=done default=ignore] pam_sss.so' "$LOCK_PAM"
+  fi
+  if lock_has_auth && lock_has_account; then return 0; fi
+  warn "$LOCK_PAM has a layout this tool does not know: add pam_sss.so to it manually"
+  return 1
+}
+
+cmd_sudo() {
+  if [[ $SUDO_RULES != yes ]]; then return 0; fi
+  [[ -n $ADMIN_GROUP ]] || ADMIN_GROUP=$ALLOWED_GROUP
+  [[ -n $ADMIN_GROUP ]] || die "--admin-group or --allowed-group is required for the sudo rules"
+  check_group_name "$ADMIN_GROUP"
+
+  local tmp
+  tmp=$(mktemp)
+  printf '%%%s ALL=(ALL:ALL) ALL\n' "${ADMIN_GROUP// /\\ }" >"$tmp"
+  visudo -cf "$tmp" >/dev/null || { rm -f "$tmp"; die "generated sudoers rule is invalid"; }
+  install -m 440 -o root -g root "$tmp" "$SUDOERS"
+  rm -f "$tmp"
+
+  install -d -m 755 "$(dirname "$POLKIT")"
+  printf 'polkit.addAdminRule(function(action, subject) {\n  return ["unix-group:%s"];\n});\n' "$ADMIN_GROUP" >"$POLKIT"
+  chmod 644 "$POLKIT"
+  log "sudo and polkit rules created for group: $ADMIN_GROUP"
+}
+
+detect_layout() {
+  local l
+  l=$(sed -n 's/^XKBLAYOUT=//p' /etc/vconsole.conf 2>/dev/null | head -1 | tr -d '"') || true
+  echo "${l:-us}"
+}
+
+# Internal laptop panel (eDP, LVDS, DSI), whatever its index
+detect_internal_panel() {
+  local c n
+  for c in /sys/class/drm/card*-*; do
+    n=${c##*/}
+    n=${n#card*-}
+    case $n in eDP-* | LVDS-* | DSI-*) echo "$n"; return 0 ;; esac
+  done
+  return 1
+}
+
+# Only the internal panel stays on at the login screen; every other output is
+# turned off by a catch-all rule, so any number of external monitors is covered.
+login_monitor_rules() {
+  local m=$LOGIN_MONITOR
+  [[ $m == all ]] && return 0
+  if [[ -z $m || $m == auto ]]; then
+    m=$(detect_internal_panel) || return 0
+  fi
+  [[ $m =~ ^[A-Za-z0-9_-]+$ ]] || die "invalid monitor: $m"
+  printf 'hl.monitor({ output = "", disabled = true })\n'
+  printf 'hl.monitor({ output = "%s", mode = "preferred", position = "0x0", scale = 1 })\n' "$m"
+}
+
+write_sddm_lua() {
+  local layout=${KB_LAYOUT:-$(detect_layout)} m
+  [[ $layout =~ ^[A-Za-z0-9_,:-]+$ ]] || die "invalid keyboard layout: $layout"
+  [[ -f /usr/share/sddm/hyprland.lua ]] || die "/usr/share/sddm/hyprland.lua not found"
+  {
+    cat /usr/share/sddm/hyprland.lua
+    printf '\nhl.config({ input = { kb_layout = "%s" } })\n' "$layout"
+    login_monitor_rules
+  } >"$SDDM_LUA.new"
+  chmod 644 "$SDDM_LUA.new"
+  mv "$SDDM_LUA.new" "$SDDM_LUA"
+}
+
+build_theme() {
+  local base=$THEMES/omarchy dst=$THEMES/$THEME
+  [[ -d $base ]] || die "$base not found: is this Omarchy?"
+  rm -rf "$dst.new"
+  cp -a "$base" "$dst.new"
+  install -m 644 "$SHARE/theme/Main.qml" "$SHARE/theme/user.png" "$SHARE/theme/Users.js" "$dst.new/"
+  rm -rf "$dst"
+  mv "$dst.new" "$dst"
+  "$LIB/known-users"
+}
+
+disable_autologin() {
+  local f=$SDDM_D/autologin.conf
+  install -d -m 755 "$STATE"
+  if [[ -f $f ]]; then
+    mv -f "$f" "$STATE/autologin.conf.bak"
+    log "Autologin disabled (saved in $STATE/autologin.conf.bak)"
+  elif [[ ! -f $STATE/autologin.conf.bak && -f /root/autologin.conf.bak ]]; then
+    cp -a /root/autologin.conf.bak "$STATE/autologin.conf.bak"
+    log "Imported the previous autologin setting from /root/autologin.conf.bak"
+  fi
+  if grep -qs '^\[Autologin\]' /etc/sddm.conf; then
+    warn "/etc/sddm.conf contains an [Autologin] section: remove it by hand"
+  fi
+}
+
+write_autologin() {
+  local user=$1
+  [[ $user =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid account name: $user"
+  getent passwd "$user" >/dev/null || die "unknown account: $user"
+  install -d -m 755 "$SDDM_D"
+  printf '[Autologin]\nUser=%s\nSession=omarchy.desktop\n' "$user" >"$SDDM_D/autologin.conf"
+  log "Autologin enabled for $user"
+}
+
+restore_autologin() {
+  if [[ -f $STATE/autologin.conf.bak ]]; then
+    install -d -m 755 "$SDDM_D"
+    mv -f "$STATE/autologin.conf.bak" "$SDDM_D/autologin.conf"
+    log "Autologin restored from the saved setting"
+  elif [[ -n $RESTORE_AUTOLOGIN_USER ]]; then
+    write_autologin "$RESTORE_AUTOLOGIN_USER"
+  elif [[ ! -f $SDDM_D/autologin.conf ]]; then
+    warn "no saved autologin setting: use --autologin-user <account>, or: omarchy-setup-ad autologin on <account>"
+  fi
+}
+
+cmd_autologin() {
+  case ${SUBARG[0]:-} in
+    on)
+      [[ -n ${SUBARG[1]:-} ]] || die "usage: omarchy-setup-ad autologin on <account>"
+      write_autologin "${SUBARG[1]}"
+      AUTOLOGIN_USER=${SUBARG[1]}
+      ;;
+    off)
+      AUTOLOGIN_USER=""
+      disable_autologin
+      ;;
+    *) die "usage: omarchy-setup-ad autologin <on <account>|off>" ;;
+  esac
+  log "Takes effect the next time SDDM starts (log out or reboot)"
+}
+
+legacy_cleanup() {
+  rm -f "$SDDM_D/zz-wayland-fr.conf"
+  if [[ -f /etc/systemd/system/known-users.path ]]; then
+    systemctl disable --now known-users.path 2>/dev/null || true
+    rm -f /etc/systemd/system/known-users.path /etc/systemd/system/known-users.service /usr/local/bin/sddm-known-users
+    systemctl daemon-reload
+  fi
+}
+
+cmd_login() {
+  need systemctl
+  [[ -d $SHARE/theme ]] || die "$SHARE/theme not found: reinstall the omarchy-ad package"
+  legacy_cleanup
+  build_theme
+  install -d -m 755 "$SDDM_D"
+  printf '[Theme]\nCurrent=%s\n' "$THEME" >"$SDDM_D/zz-users.conf"
+  write_sddm_lua
+  printf '[Wayland]\nCompositorCommand=start-hyprland -- --config %s\n' "$SDDM_LUA" >"$SDDM_D/zz-wayland-login.conf"
+  [[ -n $AUTOLOGIN_USER ]] || disable_autologin
+  systemctl daemon-reload
+  systemctl enable --now omarchy-ad-known-users.path
+  LOGIN_ENABLED=yes
+  log "Login screen enabled: it takes effect the next time SDDM starts (log out or reboot)"
+}
+
+finalize() {
+  save_conf
+  systemctl daemon-reload
+  systemctl enable --now omarchy-ad-reapply.path
+}
+
+cmd_reapply() {
+  if [[ ! -f $CONF ]]; then return 0; fi
+  patch_nss
+  patch_su
+  patch_lock || true
+  if [[ $LOGIN_ENABLED == yes && -d $THEMES/omarchy ]]; then
+    build_theme
+    write_sddm_lua
+    [[ -n $AUTOLOGIN_USER ]] || disable_autologin
+  fi
+  logger -t omarchy-ad "re-applied after an Omarchy change"
+}
+
+FAILS=0
+check() {
+  local label=$1
+  shift
+  if "$@" >/dev/null 2>&1; then
+    printf '  [ ok ] %s\n' "$label"
+  else
+    printf '  [FAIL] %s\n' "$label"
+    FAILS=$((FAILS + 1))
+  fi
+}
+
+is_joined() { realm list --name-only 2>/dev/null | grep -qix "$DOMAIN"; }
+sssd_not_world_readable() { [[ $(stat -c %a "$SSSD_CONF") != *[1-7] ]]; }
+nss_patched() { nss_has_sss passwd && nss_has_sss group && nss_has_sss shadow; }
+lock_patched() { lock_has_auth && lock_has_account; }
+su_patched() { ! grep -qE '^(auth|account|session)[[:space:]]+required[[:space:]]+pam_unix\.so' "$SU_PAM"; }
+autologin_off() { [[ ! -f $SDDM_D/autologin.conf ]]; }
+theme_active() { grep -qx "Current=$THEME" "$SDDM_D/zz-users.conf"; }
+sudo_rules_ok() { [[ -f $SUDOERS && -f $POLKIT ]] && visudo -c >/dev/null; }
+group_resolves() { getent group "${ALLOWED_GROUP%%,*}"; }
+no_debug() { ! grep -qE '^[[:space:]]*debug_level' "$SSSD_CONF"; }
+
+cmd_status() {
+  require_domain
+  log "Status for $DOMAIN"
+  check "joined to the domain (realm list)" is_joined
+  check "sssd is running" systemctl is-active --quiet sssd
+  check "nsswitch.conf uses sss (passwd, group, shadow)" nss_patched
+  check "sssd.conf not readable by everyone" sssd_not_world_readable
+  if [[ -n $ALLOWED_GROUP ]]; then check "allowed group resolves through NSS" group_resolves; fi
+  check "no debug_level left in sssd.conf" no_debug
+  check "su accepts AD accounts" su_patched
+  check "lock screen PAM has pam_sss (auth + account)" lock_patched
+  if [[ $SUDO_RULES == yes ]]; then check "sudo and polkit rules present, sudoers valid" sudo_rules_ok; fi
+  if [[ $LOGIN_ENABLED == yes ]]; then
+    check "login theme installed" test -f "$THEMES/$THEME/Main.qml"
+    check "login theme selected in SDDM" theme_active
+    if [[ -z $AUTOLOGIN_USER ]]; then check "autologin disabled" autologin_off; fi
+    check "user list refresh active" systemctl is-active --quiet omarchy-ad-known-users.path
+  fi
+  check "re-apply watcher active" systemctl is-active --quiet omarchy-ad-reapply.path
+  if ((FAILS > 0)); then
+    printf '\n%d check(s) failed. Try: sudo omarchy-setup-ad reapply\n' "$FAILS"
+    return 1
+  fi
+  printf '\nAll checks passed.\n'
+}
+
+cmd_undo() {
+  confirm "Remove the login screen, PAM and sudo changes made by omarchy-setup-ad?" || die "aborted"
+  systemctl disable --now omarchy-ad-reapply.path omarchy-ad-known-users.path 2>/dev/null || true
+
+  rm -f "$SDDM_D/zz-users.conf" "$SDDM_D/zz-wayland-login.conf" "$SDDM_LUA"
+  rm -rf "${THEMES:?}/$THEME"
+  restore_autologin
+
+  if [[ -f $LOCK_PAM ]]; then
+    sed -i -E \
+      -e '/^auth[[:space:]]+sufficient[[:space:]]+pam_sss\.so forward_pass/d' \
+      -e '/^account[[:space:]]+\[success=done default=ignore\][[:space:]]+pam_sss\.so/d' \
+      "$LOCK_PAM"
+  fi
+  if [[ -f $SU_PAM ]]; then
+    sed -i -E \
+      -e 's/^auth include system-auth$/auth            required        pam_unix.so/' \
+      -e 's/^account include system-auth$/account         required        pam_unix.so/' \
+      -e 's/^session include system-auth$/session         required        pam_unix.so/' \
+      "$SU_PAM"
+  fi
+  sed -i '/# omarchy-ad$/d' "$LOGIN_PAM"
+  rm -f "$SUDOERS" "$POLKIT" "$CONF"
+  systemctl daemon-reload
+
+  if [[ $LEAVE_DOMAIN == yes ]]; then
+    require_domain
+    realm leave -v "$DOMAIN"
+  else
+    log "Still joined to the domain (use --leave to leave it). sssd.conf was left unchanged."
+  fi
+  log "Done. Restart SDDM or reboot to get the stock login screen back."
+}
+
+parse_opts() {
+  while (($#)); do
+    case $1 in
+      --domain) DOMAIN=${2:?missing value for --domain}; shift 2 ;;
+      --join-user) JOIN_USER=${2:?missing value for --join-user}; shift 2 ;;
+      --allowed-group) ALLOWED_GROUP=${2:?missing value for --allowed-group}; shift 2 ;;
+      --admin-group) ADMIN_GROUP=${2:?missing value for --admin-group}; shift 2 ;;
+      --kb-layout) KB_LAYOUT=${2:?missing value for --kb-layout}; shift 2 ;;
+      --login-monitor) LOGIN_MONITOR=${2:?missing value for --login-monitor}; shift 2 ;;
+      --no-sudo-rules) SUDO_RULES=no; shift ;;
+      --leave) LEAVE_DOMAIN=yes; shift ;;
+      --autologin-user) RESTORE_AUTOLOGIN_USER=${2:?missing value for --autologin-user}; shift 2 ;;
+      --yes | -y) ASSUME_YES=yes; shift ;;
+      -h | --help) usage; exit 0 ;;
+      -*) die "unknown option: $1 (see --help)" ;;
+      *) SUBARG+=("$1"); shift ;;
+    esac
+  done
+}
+
+main() {
+  local cmd=${1:-help}
+  shift || true
+
+  case $cmd in
+    help | -h | --help) usage; exit 0 ;;
+    join | sudo | login | all | reapply | status | undo | autologin) ;;
+    *) usage >&2; exit 1 ;;
+  esac
+
+  if ((EUID != 0)); then
+    exec sudo -- "$(readlink -f "$0")" "$cmd" "$@"
+  fi
+
+  load_conf
+  parse_opts "$@"
+
+  case $cmd in
+    join) cmd_join; finalize ;;
+    sudo) cmd_sudo; finalize ;;
+    login) cmd_login; finalize ;;
+    all) cmd_join; cmd_sudo; cmd_login; finalize ;;
+    reapply) cmd_reapply ;;
+    status) cmd_status ;;
+    undo) cmd_undo ;;
+    autologin) cmd_autologin; if [[ -f $CONF ]]; then save_conf; fi ;;
+  esac
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+fi
