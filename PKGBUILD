@@ -1,6 +1,6 @@
 pkgname=omarchy-ad
 pkgver=0.1.0
-pkgrel=4
+pkgrel=6
 pkgdesc='Active Directory join and multi-user login screen for Omarchy'
 arch=('any')
 license=('MIT')

@@ -424,7 +424,16 @@ su_patched() { ! grep -qE '^(auth|account|session)[[:space:]]+required[[:space:]
 autologin_off() { [[ ! -f $SDDM_D/autologin.conf ]]; }
 theme_active() { grep -qx "Current=$THEME" "$SDDM_D/zz-users.conf"; }
 sudo_rules_ok() { [[ -f $SUDOERS && -f $POLKIT ]] && visudo -c >/dev/null; }
-group_resolves() { getent group "${ALLOWED_GROUP%%,*}"; }
+# SSSD fills its cache lazily: right after a restart the first lookup can miss
+# a group that exists, so try again for up to 30 seconds before calling it failed.
+group_resolves() {
+  local group=${ALLOWED_GROUP%%,*} attempt
+  for attempt in {1..30}; do
+    getent group "$group" >/dev/null && return 0
+    sleep 1
+  done
+  return 1
+}
 no_debug() { ! grep -qE '^[[:space:]]*debug_level' "$SSSD_CONF"; }
 
 cmd_status() {
